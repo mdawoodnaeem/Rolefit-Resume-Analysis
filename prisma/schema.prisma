@@ -1,0 +1,426 @@
+// RoleFit data model
+//
+// Connection URLs are not here — Prisma 7 moved them to prisma.config.ts.
+// See that file for why DIRECT_URL (migrations) and DATABASE_URL (runtime,
+// via the pg driver adapter in src/server/db.ts) are two different things.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum PlanTier {
+  FREE
+  PRO
+}
+
+enum ResumeSourceType {
+  UPLOAD_PDF
+  UPLOAD_DOCX
+  PASTE
+}
+
+enum JobSourceType {
+  PASTE
+  URL
+}
+
+enum AnalysisStatus {
+  PENDING
+  RUNNING
+  COMPLETE
+  FAILED
+}
+
+enum ApplicationStatus {
+  DRAFT
+  APPLIED
+  INTERVIEWING
+  REJECTED
+  OFFER
+}
+
+/// One row per model call, not per analysis — a single analysis fans out into
+/// several of these, which is the granularity cost debugging actually needs.
+enum AiOperation {
+  EXTRACT_RESUME
+  EXTRACT_JOB
+  SCORE_AND_GAPS
+  REWRITE
+  CRITIQUE
+}
+
+enum UsageStatus {
+  OK
+  CACHED
+  RATE_LIMITED
+  ERROR
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  emailVerified DateTime?
+  name          String?
+  image         String?
+
+  /// Null for OAuth-only users. A user can hold a password, a GitHub account,
+  /// or both — so this cannot be required, and neither can Account.
+  passwordHash String?
+
+  role UserRole @default(USER)
+  plan PlanTier @default(FREE)
+
+  /// Session revocation without a session table.
+  ///
+  /// Auth.js v5's Credentials provider only works with the JWT strategy, so
+  /// the adapter never mints DB sessions and a Session row would be dead
+  /// weight. Instead this integer is baked into every JWT and re-checked on a
+  /// throttled interval: bump it and every outstanding token for this user
+  /// stops validating. Costs one small column; buys real "sign out everywhere".
+  sessionVersion Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts        Account[]
+  resumes         Resume[]
+  jobDescriptions JobDescription[]
+  analyses        Analysis[]
+  tailoredResumes TailoredResume[]
+  applications    Application[]
+  usageLogs       UsageLog[]
+
+  @@index([createdAt])
+}
+
+/// Auth.js OAuth account linkage. Shape is dictated by @auth/prisma-adapter.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+/// Also required by the adapter, for email verification tokens.
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Resumes
+// ---------------------------------------------------------------------------
+
+/// The stable identity of a resume ("My backend CV"). Content lives in
+/// ResumeVersion. This split is the most important shape in the schema:
+/// analyses reference a *version*, so editing your resume tomorrow can never
+/// retroactively change what last week's analysis was scored against.
+model Resume {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions ResumeVersion[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+}
+
+model ResumeVersion {
+  id            String           @id @default(cuid())
+  resumeId      String
+  versionNumber Int
+  sourceType    ResumeSourceType
+  originalName  String?
+
+  /// Text as extracted, before the user corrects it. Kept so a parser bug can
+  /// be diagnosed after the fact.
+  rawText String @db.Text
+
+  /// A ResumeDocument, validated by Zod on the way in and on the way out.
+  ///
+  /// Deliberately not normalised into Experience/Education/Skill tables: the
+  /// document is heterogeneous, and it is always loaded whole and never
+  /// queried across. Six tables and a join would buy nothing here.
+  structured Json
+
+  charCount     Int
+  tokenEstimate Int
+  createdAt     DateTime @default(now())
+
+  resume   Resume     @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+  analyses Analysis[]
+
+  @@unique([resumeId, versionNumber])
+  @@index([resumeId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Job descriptions
+// ---------------------------------------------------------------------------
+
+model JobDescription {
+  id         String        @id @default(cuid())
+  userId     String
+  sourceType JobSourceType
+  sourceUrl  String?
+  rawText    String        @db.Text
+
+  /// A JobSpec: title, seniority, required/preferred skills, responsibilities.
+  structured Json
+
+  /// sha256 of the normalised text, so re-pasting the same posting reuses the
+  /// existing row instead of accumulating near-duplicates.
+  contentHash String
+  createdAt   DateTime @default(now())
+
+  user     User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  analyses Analysis[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([contentHash])
+}
+
+// ---------------------------------------------------------------------------
+// Analysis
+// ---------------------------------------------------------------------------
+
+/// An immutable record of one scoring run.
+///
+/// Both foreign keys are nullable with onDelete: SetNull, and the structured
+/// inputs are snapshotted alongside. An Analysis is a record of something that
+/// happened, so it has to outlive its inputs — deleting a resume should not
+/// silently destroy the application history that references it, and Restrict
+/// would instead make the resume undeletable, which is worse.
+model Analysis {
+  id     String @id @default(cuid())
+  userId String
+
+  resumeVersionId  String?
+  jobDescriptionId String?
+
+  /// Snapshots of the structured inputs (not the raw text — that would double
+  /// storage for no recall benefit) so this row renders standalone forever.
+  resumeSnapshot Json
+  jobSnapshot    Json
+
+  status       AnalysisStatus @default(PENDING)
+  errorMessage String?
+
+  overallScore Int?
+  /// SubScores: five weighted dimensions, each with a non-empty evidence[].
+  subScores    Json?
+  /// Gap[]: severity, requirement, suggested action.
+  gaps         Json?
+  /// KeywordReport: present/missing terms and placement suggestions.
+  keywords     Json?
+
+  modelId       String?
+  promptVersion String?
+  /// sha256(resume + jd + promptVersion + modelId). Points at AnalysisCache.
+  cacheKey      String?
+  cacheHit      Boolean @default(false)
+  /// True when produced from fixtures rather than a live model call.
+  demoMode      Boolean @default(false)
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resumeVersion   ResumeVersion?  @relation(fields: [resumeVersionId], references: [id], onDelete: SetNull)
+  jobDescription  JobDescription? @relation(fields: [jobDescriptionId], references: [id], onDelete: SetNull)
+  tailoredResumes TailoredResume[]
+  applications    Application[]
+  usageLogs       UsageLog[]
+
+  /// Drives the monthly quota count and the dashboard, the two hottest reads.
+  @@index([userId, startedAt(sort: Desc)])
+  @@index([cacheKey])
+}
+
+/// Content-addressed result cache.
+///
+/// Separate from Analysis on purpose: cache lifetime is independent of user
+/// data, so a prompt-version bump can TRUNCATE this table without touching
+/// anyone's history. The unique key also makes dedupe race-safe at the
+/// database level (INSERT ... ON CONFLICT DO NOTHING) rather than in app code,
+/// which matters when two identical requests land at once.
+model AnalysisCache {
+  key           String   @id
+  payload       Json
+  modelId       String
+  promptVersion String
+  hitCount      Int      @default(0)
+  createdAt     DateTime @default(now())
+  lastHitAt     DateTime @default(now())
+  expiresAt     DateTime
+
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Tailored output
+// ---------------------------------------------------------------------------
+
+model TailoredResume {
+  id            String @id @default(cuid())
+  analysisId    String
+  userId        String
+  versionNumber Int    @default(1)
+
+  summary String @db.Text
+  /// A ResumeDocument — same shape as ResumeVersion.structured, so the PDF and
+  /// DOCX exporters read one model and cannot drift apart.
+  structured Json
+  /// DiffSegment[]: original vs tailored with per-segment change ids.
+  diff Json
+
+  /// Ids the user explicitly kept. Nothing is applied wholesale.
+  acceptedChangeIds String[]
+
+  /// The anti-fabrication pass's output, persisted rather than recomputed.
+  /// It is the receipt for every claim that was reverted, and the UI shows it.
+  critiqueReport Json
+
+  modelId       String?
+  promptVersion String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  analysis     Analysis      @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applications Application[]
+
+  @@unique([analysisId, versionNumber])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Tracker
+// ---------------------------------------------------------------------------
+
+model Application {
+  id               String  @id @default(cuid())
+  userId           String
+  analysisId       String?
+  tailoredResumeId String?
+
+  company   String
+  roleTitle String
+  location  String?
+  jobUrl    String?
+
+  status ApplicationStatus @default(DRAFT)
+  notes  String?           @db.Text
+
+  /// Denormalised from Analysis.overallScore.
+  ///
+  /// The dashboard aggregates (average score, per-week volume, response rate)
+  /// are the most-read query in the app, and forcing a two-hop join for every
+  /// card is wasteful. It is also the more correct number: the score *at the
+  /// time you applied* is the historically meaningful one, and it must survive
+  /// the analysis being deleted.
+  matchScoreSnapshot Int?
+
+  appliedAt    DateTime?
+  respondedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  analysis       Analysis?       @relation(fields: [analysisId], references: [id], onDelete: SetNull)
+  tailoredResume TailoredResume? @relation(fields: [tailoredResumeId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@index([userId, appliedAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Metering
+// ---------------------------------------------------------------------------
+
+model UsageLog {
+  id         String  @id @default(cuid())
+  userId     String?
+  analysisId String?
+
+  operation     AiOperation
+  modelId       String
+  promptVersion String
+
+  /// Split out rather than summed, because they are billed at different rates:
+  /// cache reads are ~0.1x and cache writes ~1.25x of the base input price.
+  /// Collapsing them into one "inputTokens" makes the cost column a guess.
+  inputTokens      Int @default(0)
+  outputTokens     Int @default(0)
+  cacheWriteTokens Int @default(0)
+  cacheReadTokens  Int @default(0)
+
+  /// Decimal, not Float. It is money, even when it is an estimate.
+  estimatedCostUsd Decimal @default(0) @db.Decimal(12, 6)
+
+  latencyMs Int
+  status    UsageStatus @default(OK)
+  errorCode String?
+  createdAt DateTime    @default(now())
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  analysis Analysis? @relation(fields: [analysisId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@index([operation, createdAt(sort: Desc)])
+}
+
+/// Token bucket for short-window burst limiting on AI routes.
+///
+/// Postgres rather than Redis: one less service to provision, it works on
+/// serverless, and refill+consume is a single atomic UPDATE ... RETURNING, so
+/// there is no read-modify-write race. Swap in Upstash if this ever becomes
+/// the bottleneck — it will not at five analyses per user per month.
+model RateLimitBucket {
+  key          String   @id
+  tokens       Float
+  lastRefillAt DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@index([lastRefillAt])
+}
